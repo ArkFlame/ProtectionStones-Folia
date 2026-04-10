@@ -61,21 +61,8 @@ public class PSStandardRegion extends PSRegion {
 
     @Override
     public void setName(String name) {
-        HashMap<String, ArrayList<String>> m = ProtectionStones.regionNameToID.get(getWorld().getUID());
-        if (m == null) { // if the world has not been added
-            ProtectionStones.regionNameToID.put(getWorld().getUID(), new HashMap<>());
-            m = ProtectionStones.regionNameToID.get(getWorld().getUID());
-        }
-        if (m.get(getName()) != null) {
-            m.get(getName()).remove(getId());
-        }
-        if (name != null) {
-            if (m.containsKey(name)) {
-                m.get(name).add(getId());
-            } else {
-                m.put(name, new ArrayList<>(Collections.singletonList(getId())));
-            }
-        }
+        ProtectionStones.removeRegionAlias(getWorld(), getName(), getId());
+        ProtectionStones.addRegionAlias(getWorld(), name, getId());
         wgregion.setFlag(FlagHandler.PS_NAME, name);
     }
 
@@ -509,14 +496,7 @@ public class PSStandardRegion extends PSRegion {
 
         // remove name from cache
         if (getName() != null) {
-            HashMap<String, ArrayList<String>> rIds = ProtectionStones.regionNameToID.get(getWorld().getUID());
-            if (rIds != null && rIds.containsKey(getName())) {
-                if (rIds.get(getName()).size() == 1) {
-                    rIds.remove(getName());
-                } else {
-                    rIds.get(getName()).remove(getId());
-                }
-            }
+            ProtectionStones.removeRegionAlias(getWorld(), getName(), getId());
         }
 
         // remove region from WorldGuard

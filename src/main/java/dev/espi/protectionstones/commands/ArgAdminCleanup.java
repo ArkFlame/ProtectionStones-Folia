@@ -20,6 +20,7 @@ import com.sk89q.worldguard.protection.regions.ProtectedRegion;
 import dev.espi.protectionstones.PSL;
 import dev.espi.protectionstones.PSRegion;
 import dev.espi.protectionstones.ProtectionStones;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.utils.WGUtils;
 import org.bukkit.*;
 import org.bukkit.command.CommandSender;
@@ -31,11 +32,37 @@ import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 class ArgAdminCleanup {
 
-    private static File previewFile;
-    private static FileWriter previewFileOutputStream;
+    private static final class PreviewState {
+        private final File previewFile;
+        private final FileWriter previewFileOutputStream;
+        private final AtomicInteger pendingPreviewWrites = new AtomicInteger();
+        private final AtomicBoolean cleanupFinished = new AtomicBoolean(false);
+        private final AtomicBoolean previewFinalized = new AtomicBoolean(false);
+
+        private PreviewState(File previewFile, FileWriter previewFileOutputStream) {
+            this.previewFile = previewFile;
+            this.previewFileOutputStream = previewFileOutputStream;
+        }
+    }
+
+    private static final class CleanupPlan {
+        private final boolean removeOperation;
+        private final List<PSRegion> regions;
+        private final PreviewState previewState;
+        private final String headerMessage;
+
+        private CleanupPlan(boolean removeOperation, List<PSRegion> regions, PreviewState previewState, String headerMessage) {
+            this.removeOperation = removeOperation;
+            this.regions = regions;
+            this.previewState = previewState;
+            this.headerMessage = headerMessage;
+        }
+    }
 
     // /ps admin cleanup [remove/preview]
     static boolean argumentAdminCleanup(CommandSender p, String[] preParseArgs) {
@@ -73,15 +100,16 @@ class ArgAdminCleanup {
         }
 
         // create preview file
+        PreviewState previewState = null;
         if (cleanupOperation.equals("preview")) {
             DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd H-m-s");
-            previewFile = new File(ProtectionStones.getInstance().getDataFolder().getAbsolutePath() + "/" + LocalDateTime.now().format(formatter) + " cleanup preview.txt");
+            File previewFile = new File(ProtectionStones.getInstance().getDataFolder().getAbsolutePath() + "/" + LocalDateTime.now().format(formatter) + " cleanup preview.txt");
             try {
                 previewFile.createNewFile();
-                previewFileOutputStream = new FileWriter(previewFile);
+                previewState = new PreviewState(previewFile, new FileWriter(previewFile));
             } catch (IOException e) {
                 e.printStackTrace();
-                p.sendMessage(ChatColor.RED + "Internal error, please check the console logs.");
+                PSL.msg(p, ChatColor.RED + "Internal error, please check the console logs.");
                 return true;
             }
         }
@@ -91,13 +119,11 @@ class ArgAdminCleanup {
 
         // async cleanup task
         String finalAlias = alias;
-        Bukkit.getScheduler().runTaskAsynchronously(ProtectionStones.getInstance(), () -> {
-            int days = (args.size() > 0) ? Integer.parseInt(args.get(0)) : 30; // 30 days is default if days aren't specified
-
-            PSL.msg(p, PSL.ADMIN_CLEANUP_HEADER.msg()
-                    .replace("%arg%", cleanupOperation)
-                    .replace("%days%", "" + days));
-
+        final CommandSender commandSender = p;
+        final PreviewState finalPreviewState = previewState;
+        final int daysValue = (args.size() > 0) ? Integer.parseInt(args.get(0)) : 30;
+        
+        FoliaScheduler.callGlobal(() -> {
             HashSet<UUID> activePlayers = new HashSet<>();
 
             // loop over offline players and add to list if they haven't joined recently
@@ -105,7 +131,7 @@ class ArgAdminCleanup {
                 long lastPlayed = (System.currentTimeMillis() - op.getLastPlayed()) / 86400000L;
                 try {
                     // a player is active if they have joined within the days
-                    if (lastPlayed < days) {
+                    if (lastPlayed < daysValue) {
                         activePlayers.add(op.getUniqueId());
                     }
                 } catch (Exception e) {
@@ -113,7 +139,7 @@ class ArgAdminCleanup {
                 }
             }
 
-            // loop over all regions async and find regions to delete
+            // loop over all regions in global phase and find regions to delete
             List<PSRegion> toDelete = new ArrayList<>();
             for (String regionId : regions.keySet()) {
                 PSRegion r = PSRegion.fromWGRegion(w, regions.get(regionId));
@@ -137,59 +163,127 @@ class ArgAdminCleanup {
                 }
             }
 
-            // start recursive iteration to delete a region each tick
-            Iterator<PSRegion> deleteRegionsIterator = toDelete.iterator();
-            regionLoop(deleteRegionsIterator, p, cleanupOperation.equalsIgnoreCase("remove"));
+            String headerMessage = PSL.ADMIN_CLEANUP_HEADER.msg()
+                    .replace("%arg%", cleanupOperation)
+                    .replace("%days%", "" + daysValue);
+            return new CleanupPlan(cleanupOperation.equalsIgnoreCase("remove"), toDelete, finalPreviewState, headerMessage);
+        }).thenAccept(result -> {
+            CleanupPlan plan = (CleanupPlan) result;
+            Runnable completion = () -> {
+                PSL.msg(commandSender, plan.headerMessage);
+                regionLoop(plan.regions.iterator(), commandSender, plan.removeOperation, plan.previewState);
+            };
+            if (commandSender instanceof Player) {
+                FoliaScheduler.runEntity((Player) commandSender, completion);
+            } else {
+                FoliaScheduler.runGlobal(completion);
+            }
         });
         return true;
     }
 
-    static private void regionLoop(Iterator<PSRegion> deleteRegionsIterator, CommandSender p, boolean isRemoveOperation) {
+    static private void regionLoop(Iterator<PSRegion> deleteRegionsIterator, CommandSender p, boolean isRemoveOperation, PreviewState previewState) {
         if (deleteRegionsIterator.hasNext()) {
-            Bukkit.getScheduler().runTaskLater(ProtectionStones.getInstance(), () ->
-                    processRegion(deleteRegionsIterator, p, isRemoveOperation), 1);
-        } else { // finished region iteration
-            PSL.msg(p, PSL.ADMIN_CLEANUP_FOOTER.msg()
-                    .replace("%arg%", isRemoveOperation ? "remove" : "preview"));
-
-            // flush and close preview file
-            if (!isRemoveOperation) {
-                try {
-                    p.sendMessage(ChatColor.YELLOW + "Dumped the list regions that can be deleted in " + previewFile.getName() + " (in the plugin folder).");
-                    previewFileOutputStream.flush();
-                    previewFileOutputStream.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
+            FoliaScheduler.runGlobalLater(() ->
+                    processRegion(deleteRegionsIterator, p, isRemoveOperation, previewState), 1);
+        } else {
+            markCleanupFinished(p, isRemoveOperation, previewState);
         }
     }
 
     // Process a region, and then iterate to the next region on the next tick.
     // This is to prevent the server from pausing for the entire duration of the cleanup.
     // (lag from loading chunks to remove protection blocks)
-    static private void processRegion(Iterator<PSRegion> deleteRegionsIterator, CommandSender p, boolean isRemoveOperation) {
+    static private void processRegion(Iterator<PSRegion> deleteRegionsIterator, CommandSender p, boolean isRemoveOperation, PreviewState previewState) {
         PSRegion r = deleteRegionsIterator.next();
 
         if (isRemoveOperation) { // delete
 
-            p.sendMessage(ChatColor.YELLOW + "Removed region " + r.getId() + " due to inactive owners.");
+            sendOnSender(p, ChatColor.YELLOW + "Removed region " + r.getId() + " due to inactive owners.");
 
-            // must be sync
-            r.deleteRegion(true);
+            if (r.isHidden()) {
+                FoliaScheduler.runGlobal(() -> {
+                    r.deleteRegion(false);
+                    regionLoop(deleteRegionsIterator, p, true, previewState);
+                });
+            } else {
+                FoliaScheduler.runRegion(r.getProtectBlock().getLocation(), () -> {
+                    r.getProtectBlock().setType(Material.AIR);
+                    FoliaScheduler.runGlobal(() -> {
+                        r.deleteRegion(false);
+                        regionLoop(deleteRegionsIterator, p, true, previewState);
+                    });
+                });
+            }
+            return;
         } else { // preview
 
-            p.sendMessage(ChatColor.YELLOW + "Found region " + r.getId() + " that can be deleted.");
+            sendOnSender(p, ChatColor.YELLOW + "Found region " + r.getId() + " that can be deleted.");
 
             // adds region id to preview file
+            previewState.pendingPreviewWrites.incrementAndGet();
             try {
-                previewFileOutputStream.write(r.getId() + "\n");
-            } catch (IOException e) {
+                final String regionId = r.getId();
+                FoliaScheduler.runAsync(() -> {
+                    try {
+                        synchronized (previewState.previewFileOutputStream) {
+                            previewState.previewFileOutputStream.write(regionId + "\n");
+                        }
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    } finally {
+                        previewState.pendingPreviewWrites.decrementAndGet();
+                        tryFinalizePreview(p, previewState);
+                    }
+                });
+            } catch (Exception e) {
                 e.printStackTrace();
+                previewState.pendingPreviewWrites.decrementAndGet();
             }
         }
 
         // go to next region
-        regionLoop(deleteRegionsIterator, p, isRemoveOperation);
+        regionLoop(deleteRegionsIterator, p, isRemoveOperation, previewState);
+    }
+
+    private static void markCleanupFinished(CommandSender sender, boolean isRemoveOperation, PreviewState previewState) {
+        if (previewState == null) {
+            sendOnSender(sender, PSL.ADMIN_CLEANUP_FOOTER.msg().replace("%arg%", "remove"));
+            return;
+        }
+
+        previewState.cleanupFinished.set(true);
+        tryFinalizePreview(sender, previewState);
+    }
+
+    private static void tryFinalizePreview(CommandSender sender, PreviewState previewState) {
+        if (previewState == null || previewState.cleanupFinished.get() == false) {
+            return;
+        }
+        if (previewState.pendingPreviewWrites.get() != 0) {
+            return;
+        }
+        if (!previewState.previewFinalized.compareAndSet(false, true)) {
+            return;
+        }
+
+        FoliaScheduler.runAsync(() -> {
+            try {
+                previewState.previewFileOutputStream.flush();
+                previewState.previewFileOutputStream.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            sendOnSender(sender, PSL.ADMIN_CLEANUP_FOOTER.msg().replace("%arg%", "preview"));
+            sendOnSender(sender, ChatColor.YELLOW + "Dumped the list regions that can be deleted in " + previewState.previewFile.getName() + " (in the plugin folder).");
+        });
+    }
+
+    private static void sendOnSender(CommandSender sender, String message) {
+        if (sender instanceof Player) {
+            FoliaScheduler.runEntity((Player) sender, () -> PSL.msg(sender, message));
+        } else {
+            FoliaScheduler.runGlobal(() -> PSL.msg(sender, message));
+        }
     }
 }

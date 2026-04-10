@@ -25,6 +25,7 @@ import com.sk89q.worldguard.protection.managers.RegionManager;
 import com.sk89q.worldguard.protection.regions.ProtectedCuboidRegion;
 import com.sk89q.worldguard.protection.regions.ProtectedRegion;
 import dev.espi.protectionstones.commands.ArgMerge;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.event.PSCreateEvent;
 import dev.espi.protectionstones.utils.LimitUtil;
 import dev.espi.protectionstones.utils.MiscUtil;
@@ -41,22 +42,26 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class BlockHandler {
-    private static HashMap<Player, Double> lastProtectStonePlaced = new HashMap<>();
+    private static final ConcurrentHashMap<UUID, Double> lastProtectStonePlaced = new ConcurrentHashMap<>();
 
     private static String checkCooldown(Player p) {
         double currentTime = System.currentTimeMillis();
-        if (lastProtectStonePlaced.containsKey(p)) {
+        UUID uuid = p.getUniqueId();
+        if (lastProtectStonePlaced.containsKey(uuid)) {
             double cooldown = ProtectionStones.getInstance().getConfigOptions().placingCooldown; // seconds
-            double lastPlace = lastProtectStonePlaced.get(p); // milliseconds
+            double lastPlace = lastProtectStonePlaced.get(uuid); // milliseconds
 
             if (lastPlace + cooldown * 1000 > currentTime) { // if cooldown has not been finished
                 return String.format("%.1f", cooldown - ((currentTime - lastPlace) / 1000));
             }
-            lastProtectStonePlaced.remove(p);
+            lastProtectStonePlaced.remove(uuid);
         }
-        lastProtectStonePlaced.put(p, currentTime);
+        lastProtectStonePlaced.put(uuid, currentTime);
         return null;
     }
 
@@ -275,7 +280,8 @@ public class BlockHandler {
         if (blockOptions.autoHide) {
             PSL.msg(p, PSL.REGION_HIDDEN.msg());
             // run on next tick so placing tile entities don't complain
-            Bukkit.getScheduler().runTask(ProtectionStones.getInstance(), () -> l.getBlock().setType(Material.AIR));
+            Location blockLoc = l;
+            FoliaScheduler.runRegion(blockLoc, () -> blockLoc.getBlock().setType(Material.AIR));
         }
 
         if (blockOptions.startWithTaxAutopay) {
@@ -312,16 +318,31 @@ public class BlockHandler {
             // actually do auto merge
             if (!showGUI) {
                 PSRegion finalMergeTo = mergeTo;
-                Bukkit.getScheduler().runTaskAsynchronously(ProtectionStones.getInstance(), () -> {
+                UUID playerUuid = p.getUniqueId();
+                World playerWorld = p.getWorld();
+                RegionManager regionManager = r.getWGRegionManager();
+                AtomicReference<MergeResult> resultHolder = new AtomicReference<>(MergeResult.PENDING);
+
+                FoliaScheduler.runGlobal(() -> {
                     try {
-                        WGMerge.mergeRealRegions(p.getWorld(), r.getWGRegionManager(), finalMergeTo, Arrays.asList(finalMergeTo, r));
-                        PSL.msg(p, PSL.MERGE_AUTO_MERGED.msg().replace("%region%", finalMergeTo.getId()));
+                        WGMerge.mergeRealRegions(playerWorld, regionManager, finalMergeTo, Arrays.asList(finalMergeTo, r));
+                        resultHolder.set(MergeResult.SUCCESS);
                     } catch (WGMerge.RegionHoleException e) {
-                        PSL.msg(p, PSL.NO_REGION_HOLES.msg()); // TODO github issue #120, prevent holes even if showGUI is true
+                        resultHolder.set(MergeResult.HOLE);
                     } catch (WGMerge.RegionCannotMergeWhileRentedException e) {
-                        // don't need to tell player that you can't merge
+                        resultHolder.set(MergeResult.RENTED);
                     }
                 });
+
+                // Poll for completion (simple approach)
+                FoliaScheduler.runGlobalLater(() -> {
+                    MergeResult result = resultHolder.get();
+                    if (result == MergeResult.SUCCESS) {
+                        PSL.msg(p, PSL.MERGE_AUTO_MERGED.msg().replace("%region%", finalMergeTo.getId()));
+                    } else if (result == MergeResult.HOLE) {
+                        PSL.msg(p, PSL.NO_REGION_HOLES.msg());
+                    }
+                }, 1L);
             }
         }
 
@@ -336,5 +357,9 @@ public class BlockHandler {
                 p.sendMessage(ChatColor.WHITE + ""); // send empty line
             }
         }
+    }
+
+    private enum MergeResult {
+        PENDING, SUCCESS, HOLE, RENTED
     }
 }

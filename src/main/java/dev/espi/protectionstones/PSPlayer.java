@@ -287,8 +287,8 @@ public class PSPlayer {
     }
 
     /**
-     * Get the list of regions that a player owns, or is a member of. It is recommended to run this asynchronously
-     * since the query can be slow.
+     * Get the list of regions that a player owns, or is a member of.
+     * Callers must already be on the correct Folia execution domain for region access.
      *
      * @param w           world to search for regions in
      * @param canBeMember whether or not to add regions where the player is a member, not owner
@@ -307,8 +307,8 @@ public class PSPlayer {
     }
 
     /**
-     * Get the list of regions that a player owns, or is a member of. It is recommended to run this asynchronously
-     * since the query can be slow.
+     * Get the list of regions that a player owns, or is a member of.
+     * Callers must already be on the correct Folia execution domain for region access.
      *
      * Note: Regions that the player owns that are named will be cross-world, otherwise this only searches in one world.
      *

@@ -16,6 +16,7 @@
 package dev.espi.protectionstones.commands;
 
 import dev.espi.protectionstones.*;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.utils.MiscUtil;
 import dev.espi.protectionstones.utils.TextGUI;
 import dev.espi.protectionstones.utils.UUIDCache;
@@ -25,8 +26,9 @@ import net.md_5.bungee.api.chat.HoverEvent;
 import net.md_5.bungee.api.chat.TextComponent;
 import net.milkbowl.vault.economy.EconomyResponse;
 import org.apache.commons.lang3.math.NumberUtils;
-import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
+import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.util.StringUtil;
@@ -34,6 +36,114 @@ import org.bukkit.util.StringUtil;
 import java.util.*;
 
 public class ArgTax implements PSCommandArg {
+
+    private static final class TaxInfoPageResult {
+        private final List<TextComponent> entries;
+        private final boolean hasNextPage;
+        private final int pageNum;
+
+        private TaxInfoPageResult(List<TextComponent> entries, boolean hasNextPage, int pageNum) {
+            this.entries = entries;
+            this.hasNextPage = hasNextPage;
+            this.pageNum = pageNum;
+        }
+    }
+
+    private static final class TaxRegionInfoResult {
+        private final boolean regionExists;
+        private final String regionName;
+        private final String taxRate;
+        private final String taxPeriod;
+        private final String taxPaymentPeriod;
+        private final String taxAutopayer;
+        private final String taxesOwed;
+
+        private TaxRegionInfoResult(boolean regionExists, String regionName, String taxRate, String taxPeriod, String taxPaymentPeriod, String taxAutopayer, String taxesOwed) {
+            this.regionExists = regionExists;
+            this.regionName = regionName;
+            this.taxRate = taxRate;
+            this.taxPeriod = taxPeriod;
+            this.taxPaymentPeriod = taxPaymentPeriod;
+            this.taxAutopayer = taxAutopayer;
+            this.taxesOwed = taxesOwed;
+        }
+
+        private static TaxRegionInfoResult notFound() {
+            return new TaxRegionInfoResult(false, null, null, null, null, null, null);
+        }
+
+        private static TaxRegionInfoResult display(String regionName, String taxRate, String taxPeriod, String taxPaymentPeriod, String taxAutopayer, String taxesOwed) {
+            return new TaxRegionInfoResult(true, regionName, taxRate, taxPeriod, taxPaymentPeriod, taxAutopayer, taxesOwed);
+        }
+    }
+
+    private static final class TaxPayResult {
+        private enum Type {
+            REGION_NOT_FOUND,
+            NOT_OWNER,
+            NOT_ENOUGH_MONEY,
+            DISPLAY
+        }
+
+        private final Type type;
+        private final String amount;
+        private final String regionName;
+
+        private TaxPayResult(Type type, String amount, String regionName) {
+            this.type = type;
+            this.amount = amount;
+            this.regionName = regionName;
+        }
+
+        private static TaxPayResult regionNotFound() {
+            return new TaxPayResult(Type.REGION_NOT_FOUND, null, null);
+        }
+
+        private static TaxPayResult notOwner() {
+            return new TaxPayResult(Type.NOT_OWNER, null, null);
+        }
+
+        private static TaxPayResult notEnoughMoney() {
+            return new TaxPayResult(Type.NOT_ENOUGH_MONEY, null, null);
+        }
+
+        private static TaxPayResult display(String amount, String regionName) {
+            return new TaxPayResult(Type.DISPLAY, amount, regionName);
+        }
+    }
+
+    private static final class TaxAutoPayResult {
+        private enum Type {
+            REGION_NOT_FOUND,
+            NOT_OWNER,
+            SET_NO_AUTOPAYER,
+            SET_AS_AUTOPAYER
+        }
+
+        private final Type type;
+        private final String regionName;
+
+        private TaxAutoPayResult(Type type, String regionName) {
+            this.type = type;
+            this.regionName = regionName;
+        }
+
+        private static TaxAutoPayResult regionNotFound() {
+            return new TaxAutoPayResult(Type.REGION_NOT_FOUND, null);
+        }
+
+        private static TaxAutoPayResult notOwner() {
+            return new TaxAutoPayResult(Type.NOT_OWNER, null);
+        }
+
+        private static TaxAutoPayResult setNoAutopayer(String regionName) {
+            return new TaxAutoPayResult(Type.SET_NO_AUTOPAYER, regionName);
+        }
+
+        private static TaxAutoPayResult setAsAutopayer(String regionName) {
+            return new TaxAutoPayResult(Type.SET_AS_AUTOPAYER, regionName);
+        }
+    }
 
     static final String INFO_HELP = ChatColor.AQUA + "> " + ChatColor.GRAY + "/ps tax info [region (optional)]", // maybe put in /ps info
             PAY_HELP = ChatColor.AQUA + "> " + ChatColor.GRAY + "/ps tax pay [amount] [region (optional)]",
@@ -78,7 +188,9 @@ public class ArgTax implements PSCommandArg {
         }
 
         Player p = (Player) s;
-        PSPlayer psp = PSPlayer.fromPlayer(p);
+        UUID snapshotUuid = p.getUniqueId();
+        World snapshotWorld = p.getWorld();
+        Location snapshotLocation = p.getLocation();
 
         if (args.length == 1 || args[1].equals("help")) {
             runHelp(s);
@@ -87,11 +199,11 @@ public class ArgTax implements PSCommandArg {
 
         switch (args[1]) {
             case "info":
-                return taxInfo(args, flags, psp);
+                return taxInfo(args, flags, snapshotUuid, snapshotWorld, snapshotLocation, p);
             case "pay":
-                return taxPay(args, psp);
+                return taxPay(args, snapshotUuid, snapshotWorld, snapshotLocation, p);
             case "autopay":
-                return taxAutoPay(args, psp);
+                return taxAutoPay(args, snapshotUuid, snapshotWorld, snapshotLocation, p);
             default:
                 runHelp(s);
                 break;
@@ -102,20 +214,22 @@ public class ArgTax implements PSCommandArg {
 
     private static final int GUI_SIZE = 17;
 
-    public boolean taxInfo(String[] args, HashMap<String, String> flags, PSPlayer p) {
+    public boolean taxInfo(String[] args, HashMap<String, String> flags, UUID snapshotUuid, World snapshotWorld, Location snapshotLocation, Player player) {
+        
         if (args.length == 2) { // /ps tax info
-            Bukkit.getScheduler().runTaskAsynchronously(ProtectionStones.getInstance(), () -> {
-                int pageNum = (flags.get("-p") == null || !MiscUtil.isValidInteger(flags.get("-p")) ? 0 : Integer.parseInt(flags.get("-p"))-1);
-
+            final int pageNum = (flags.get("-p") == null || !MiscUtil.isValidInteger(flags.get("-p")) ? 0 : Integer.parseInt(flags.get("-p"))-1);
+            
+            FoliaScheduler.callGlobal(() -> {
+                PSPlayer snapshotPlayer = PSPlayer.fromUUID(snapshotUuid);
                 List<TextComponent> entries = new ArrayList<>();
-                for (PSRegion r : p.getTaxEligibleRegions()) {
+                for (PSRegion r : snapshotPlayer.getTaxEligibleRegions()) {
                     double amountDue = 0;
                     for (PSRegion.TaxPayment tp : r.getTaxPaymentsDue()) {
                         amountDue += tp.getAmount();
                     }
 
                     TextComponent component;
-                    if (r.getTaxAutopayer() != null & r.getTaxAutopayer() == p.getUuid()) {
+                    if (r.getTaxAutopayer() != null && r.getTaxAutopayer().equals(snapshotPlayer.getUuid())) {
                         component = new TextComponent(PSL.TAX_PLAYER_REGION_INFO_AUTOPAYER.msg()
                                 .replace("%region%", (r.getName() == null ? r.getId() : r.getName() + " (" + r.getId() + ")"))
                                 .replace("%money%", String.format("%.2f", amountDue)));
@@ -128,106 +242,175 @@ public class ArgTax implements PSCommandArg {
                     component.setHoverEvent(new HoverEvent(HoverEvent.Action.SHOW_TEXT, new ComponentBuilder(PSL.TAX_CLICK_TO_SHOW_MORE_INFO.msg()).create()));
                     entries.add(component);
                 }
+                
+                boolean hasNextPage = pageNum * GUI_SIZE + GUI_SIZE < entries.size();
+                return new TaxInfoPageResult(entries, hasNextPage, pageNum);
+            }).thenAccept(result -> {
+                FoliaScheduler.runEntity(player, () -> {
+                    TaxInfoPageResult pageResult = (TaxInfoPageResult) result;
+                    
+                    TextGUI.displayGUI(player, PSL.TAX_INFO_HEADER.msg(), "/" + ProtectionStones.getInstance().getConfigOptions().base_command + " tax info -p %page%", pageResult.pageNum, GUI_SIZE, pageResult.entries, true);
 
-                TextGUI.displayGUI(p.getPlayer(), PSL.TAX_INFO_HEADER.msg(), "/" + ProtectionStones.getInstance().getConfigOptions().base_command + " tax info -p %page%", pageNum, GUI_SIZE, entries, true);
-
-                if (pageNum * GUI_SIZE + GUI_SIZE < entries.size())
-                    PSL.msg(p, PSL.TAX_NEXT.msg().replace("%page%", pageNum + 2 + ""));
+                    if (pageResult.hasNextPage)
+                        PSL.msg(player, PSL.TAX_NEXT.msg().replace("%page%", pageResult.pageNum + 2 + ""));
+                });
             });
         } else if (args.length == 3) { // /ps tax info [region]
-            List<PSRegion> list = ProtectionStones.getPSRegions(p.getPlayer().getWorld(), args[2]);
-            if (list.isEmpty()) {
-                return PSL.msg(p, PSL.REGION_DOES_NOT_EXIST.msg());
-            }
-            PSRegion r = list.get(0);
-            double taxesOwed = 0;
-            for (PSRegion.TaxPayment tp : r.getTaxPaymentsDue()) {
-                taxesOwed += tp.getAmount();
-            }
-
-            PSL.msg(p, PSL.TAX_REGION_INFO_HEADER.msg().replace("%region%", r.getName() == null ? r.getId() : r.getName() + " (" + r.getId() + ")"));
-            PSL.msg(p, PSL.TAX_REGION_INFO.msg()
-                        .replace("%taxrate%", String.format("%.2f", r.getTaxRate()))
-                        .replace("%taxperiod%", r.getTaxPeriod())
-                        .replace("%taxpaymentperiod%", r.getTaxPaymentPeriod())
-                        .replace("%taxautopayer%", r.getTaxAutopayer() == null ? "none" : UUIDCache.getNameFromUUID(r.getTaxAutopayer()))
-                        .replace("%taxowed%", String.format("%.2f", taxesOwed)));
+            FoliaScheduler.callGlobal(() -> {
+                PSPlayer.fromUUID(snapshotUuid);
+                List<PSRegion> list = ProtectionStones.getPSRegions(snapshotWorld, args[2]);
+                if (list.isEmpty()) {
+                    return TaxRegionInfoResult.notFound();
+                }
+                PSRegion r = list.get(0);
+                double taxesOwed = 0;
+                for (PSRegion.TaxPayment tp : r.getTaxPaymentsDue()) {
+                    taxesOwed += tp.getAmount();
+                }
+                
+                String regionName = r.getName() == null ? r.getId() : r.getName() + " (" + r.getId() + ")";
+                return TaxRegionInfoResult.display(
+                        regionName,
+                        String.format("%.2f", r.getTaxRate()),
+                        r.getTaxPeriod(),
+                        r.getTaxPaymentPeriod(),
+                        r.getTaxAutopayer() == null ? "none" : UUIDCache.getNameFromUUID(r.getTaxAutopayer()),
+                        String.format("%.2f", taxesOwed)
+                );
+            }).thenAccept(result -> {
+                FoliaScheduler.runEntity(player, () -> {
+                    TaxRegionInfoResult regionResult = (TaxRegionInfoResult) result;
+                    if (!regionResult.regionExists) {
+                        PSL.msg(player, PSL.REGION_DOES_NOT_EXIST.msg());
+                    } else {
+                        PSL.msg(player, PSL.TAX_REGION_INFO_HEADER.msg().replace("%region%", regionResult.regionName));
+                        PSL.msg(player, PSL.TAX_REGION_INFO.msg()
+                                    .replace("%taxrate%", regionResult.taxRate)
+                                    .replace("%taxperiod%", regionResult.taxPeriod)
+                                    .replace("%taxpaymentperiod%", regionResult.taxPaymentPeriod)
+                                    .replace("%taxautopayer%", regionResult.taxAutopayer)
+                                    .replace("%taxowed%", regionResult.taxesOwed));
+                    }
+                });
+            });
         } else {
-            PSL.msg(p, INFO_HELP);
+            FoliaScheduler.runEntity(player, () -> PSL.msg(player, INFO_HELP));
         }
         return true;
     }
 
-    public boolean taxPay(String[] args, PSPlayer p) {
+    public boolean taxPay(String[] args, UUID snapshotUuid, World snapshotWorld, Location snapshotLocation, Player player) {
         if (args.length != 3 && args.length != 4)
-            return PSL.msg(p, PAY_HELP);
-        // the amount to pay must be a number
+            return PSL.msg(player, PAY_HELP);
         if (!NumberUtils.isNumber(args[2]))
-            return PSL.msg(p, PAY_HELP);
-
-        PSRegion r = resolveRegion(args.length == 4 ? args[3] : null, p);
-        if (r == null) return true;
-
-        // player must be owner to pay for taxes
-        if (!r.isOwner(p.getUuid()))
-            return PSL.msg(p, PSL.NOT_OWNER.msg());
+            return PSL.msg(player, PAY_HELP);
 
         double payment = Double.parseDouble(args[2]);
-        // must be higher than or equal to zero
         if (payment <= 0)
-            return PSL.msg(p, PAY_HELP);
-        // player must have this amount of money
-        if (!p.hasAmount(payment))
-            return PSL.msg(p, PSL.NOT_ENOUGH_MONEY.msg().replace("%price%", String.format("%.2f", payment)));
+            return PSL.msg(player, PAY_HELP);
 
-        // pay tax amount
-        EconomyResponse res = r.payTax(p, payment);
-        PSL.msg(p, PSL.TAX_PAID.msg()
-                .replace("%amount%", String.format("%.2f", res.amount))
-                .replace("%region%", r.getName() == null ? r.getId() : r.getName() + "(" + r.getId() + ")"));
-        return true;
-    }
+        final String regionArg = args.length == 4 ? args[3] : null;
+        
+        if (!PSPlayer.fromUUID(snapshotUuid).hasAmount(payment))
+            return PSL.msg(player, PSL.NOT_ENOUGH_MONEY.msg().replace("%price%", String.format("%.2f", payment)));
 
-    public boolean taxAutoPay(String[] args, PSPlayer p) {
-        if (args.length != 2 && args.length != 3)
-            return PSL.msg(p, AUTOPAY_HELP);
-
-        PSRegion r = resolveRegion(args.length == 3 ? args[2] : null, p);
-        if (r == null) return true;
-
-        // player must be the owner of the region
-        if (!r.isOwner(p.getUuid()))
-            return PSL.msg(p, PSL.NOT_OWNER.msg());
-
-        if (r.getTaxAutopayer() != null && r.getTaxAutopayer().equals(p.getUuid())) { // if removing the the tax autopayer
-            r.setTaxAutopayer(null);
-            PSL.msg(p, PSL.TAX_SET_NO_AUTOPAYER.msg().replace("%region%", r.getName() == null ? r.getId() : r.getName() + "(" + r.getId() + ")"));
-        } else { // if the player is setting themselves as the tax autopayer
-            r.setTaxAutopayer(p.getUuid());
-            PSL.msg(p, PSL.TAX_SET_AS_AUTOPAYER.msg().replace("%region%", r.getName() == null ? r.getId() : r.getName() + "(" + r.getId() + ")"));
-        }
-        return true;
-    }
-
-    public PSRegion resolveRegion(String region, PSPlayer p) {
-        PSRegion r;
-        if (region == null) { // region the player is standing in
-            r = PSRegion.fromLocationGroup(p.getPlayer().getLocation());
+        FoliaScheduler.callGlobal(() -> {
+            PSPlayer snapshotPlayer = PSPlayer.fromUUID(snapshotUuid);
+            PSRegion r = resolveRegion(regionArg, snapshotWorld, snapshotLocation);
             if (r == null) {
-                PSL.msg(p, PSL.NOT_IN_REGION.msg());
+                return TaxPayResult.regionNotFound();
+            }
+            
+            if (!r.isOwner(snapshotPlayer.getUuid())) {
+                return TaxPayResult.notOwner();
+            }
+            
+            if (!snapshotPlayer.hasAmount(payment)) {
+                return TaxPayResult.notEnoughMoney();
+            }
+            
+            EconomyResponse res = r.payTax(snapshotPlayer, payment);
+            
+            String regionName = r.getName() == null ? r.getId() : r.getName() + "(" + r.getId() + ")";
+            return TaxPayResult.display(String.format("%.2f", res.amount), regionName);
+        }).thenAccept(result -> {
+            FoliaScheduler.runEntity(player, () -> {
+                TaxPayResult payResult = (TaxPayResult) result;
+                if (payResult.type == TaxPayResult.Type.REGION_NOT_FOUND) {
+                    PSL.msg(player, PSL.NOT_IN_REGION.msg());
+                } else if (payResult.type == TaxPayResult.Type.NOT_OWNER) {
+                    PSL.msg(player, PSL.NOT_OWNER.msg());
+                } else if (payResult.type == TaxPayResult.Type.NOT_ENOUGH_MONEY) {
+                    PSL.msg(player, PSL.NOT_ENOUGH_MONEY.msg().replace("%price%", String.format("%.2f", payment)));
+                } else if (payResult.type == TaxPayResult.Type.DISPLAY) {
+                    PSL.msg(player, PSL.TAX_PAID.msg()
+                            .replace("%amount%", payResult.amount)
+                            .replace("%region%", payResult.regionName));
+                }
+            });
+        });
+        return true;
+    }
+
+    public boolean taxAutoPay(String[] args, UUID snapshotUuid, World snapshotWorld, Location snapshotLocation, Player player) {
+        if (args.length != 2 && args.length != 3)
+            return PSL.msg(player, AUTOPAY_HELP);
+
+        final String regionArg = args.length == 3 ? args[2] : null;
+
+        FoliaScheduler.callGlobal(() -> {
+            PSPlayer snapshotPlayer = PSPlayer.fromUUID(snapshotUuid);
+            PSRegion r = resolveRegion(regionArg, snapshotWorld, snapshotLocation);
+            if (r == null) {
+                return TaxAutoPayResult.regionNotFound();
+            }
+            
+            if (!r.isOwner(snapshotPlayer.getUuid())) {
+                return TaxAutoPayResult.notOwner();
+            }
+            
+            String regionName = r.getName() == null ? r.getId() : r.getName() + "(" + r.getId() + ")";
+            boolean isRemoving = r.getTaxAutopayer() != null && r.getTaxAutopayer().equals(snapshotPlayer.getUuid());
+            
+            if (isRemoving) {
+                r.setTaxAutopayer(null);
+                return TaxAutoPayResult.setNoAutopayer(regionName);
+            } else {
+                r.setTaxAutopayer(snapshotPlayer.getUuid());
+                return TaxAutoPayResult.setAsAutopayer(regionName);
+            }
+        }).thenAccept(result -> {
+            FoliaScheduler.runEntity(player, () -> {
+                TaxAutoPayResult autoPayResult = (TaxAutoPayResult) result;
+                if (autoPayResult.type == TaxAutoPayResult.Type.REGION_NOT_FOUND) {
+                    PSL.msg(player, PSL.NOT_IN_REGION.msg());
+                } else if (autoPayResult.type == TaxAutoPayResult.Type.NOT_OWNER) {
+                    PSL.msg(player, PSL.NOT_OWNER.msg());
+                } else if (autoPayResult.type == TaxAutoPayResult.Type.SET_NO_AUTOPAYER) {
+                    PSL.msg(player, PSL.TAX_SET_NO_AUTOPAYER.msg().replace("%region%", autoPayResult.regionName));
+                } else if (autoPayResult.type == TaxAutoPayResult.Type.SET_AS_AUTOPAYER) {
+                    PSL.msg(player, PSL.TAX_SET_AS_AUTOPAYER.msg().replace("%region%", autoPayResult.regionName));
+                }
+            });
+        });
+        return true;
+    }
+
+    public PSRegion resolveRegion(String region, World world, Location location) {
+        PSRegion r;
+        if (region == null) {
+            r = PSRegion.fromLocationGroup(location);
+            if (r == null) {
                 return null;
             }
 
-            // if taxes are disabled for this region
             if (r.getTypeOptions() == null || r.getTypeOptions().taxPeriod == -1) {
-                PSL.msg(p, PSL.TAX_DISABLED_REGION.msg());
                 return null;
             }
 
-        } else { // region query
-            List<PSRegion> list = ProtectionStones.getPSRegions(p.getPlayer().getWorld(), region);
+        } else {
+            List<PSRegion> list = ProtectionStones.getPSRegions(world, region);
             if (list.isEmpty()) {
-                PSL.msg(p, PSL.REGION_DOES_NOT_EXIST.msg());
                 return null;
             } else {
                 r = list.get(0);

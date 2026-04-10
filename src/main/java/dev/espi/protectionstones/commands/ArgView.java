@@ -17,6 +17,7 @@ package dev.espi.protectionstones.commands;
 
 import com.sk89q.worldguard.bukkit.WorldGuardPlugin;
 import dev.espi.protectionstones.*;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.utils.ParticlesUtil;
 import dev.espi.protectionstones.utils.RegionTraverse;
 import dev.espi.protectionstones.utils.WGUtils;
@@ -25,11 +26,12 @@ import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class ArgView implements PSCommandArg {
 
-    private static List<UUID> cooldown = new ArrayList<>();
+    private static final Set<UUID> cooldown = ConcurrentHashMap.newKeySet();
 
     @Override
     public List<String> getNames() {
@@ -78,47 +80,72 @@ public class ArgView implements PSCommandArg {
 
         // add player to cooldown
         cooldown.add(p.getUniqueId());
-        Bukkit.getScheduler().runTaskLaterAsynchronously(ProtectionStones.getInstance(), () -> cooldown.remove(p.getUniqueId()), 20 * ProtectionStones.getInstance().getConfigOptions().psViewCooldown);
+        FoliaScheduler.runAsyncLater(() -> cooldown.remove(p.getUniqueId()), 20L * ProtectionStones.getInstance().getConfigOptions().psViewCooldown);
 
-        int playerY = p.getLocation().getBlockY(), minY = r.getWGRegion().getMinimumPoint().getBlockY(), maxY = r.getWGRegion().getMaximumPoint().getBlockY();
+        int minY = r.getWGRegion().getMinimumPoint().getBlockY();
+        int maxY = r.getWGRegion().getMaximumPoint().getBlockY();
 
-        // send particles to client
+        // build particle plan on global thread (static data only, no live player access)
+        List<ParticlePlan> particlePlan = new ArrayList<>();
 
-        Bukkit.getScheduler().runTaskAsynchronously(ProtectionStones.getInstance(), () -> {
-
-            AtomicInteger modU = new AtomicInteger(0);
-
-            if (r instanceof PSGroupRegion) {
-                PSGroupRegion pr = (PSGroupRegion) r;
-                for (PSMergedRegion psmr : pr.getMergedRegions()) {
-                    handlePurpleParticle(p, new Location(p.getWorld(), 0.5 + psmr.getProtectBlock().getX(), 1.5 + psmr.getProtectBlock().getY(), 0.5 + psmr.getProtectBlock().getZ()));
-                    for (int y = minY; y <= maxY; y += 10) {
-                        handlePurpleParticle(p, new Location(p.getWorld(), 0.5 + psmr.getProtectBlock().getX(), 0.5 + y, 0.5 + psmr.getProtectBlock().getZ()));
-                    }
-                }
-            } else {
-                handlePurpleParticle(p, new Location(p.getWorld(), 0.5 + r.getProtectBlock().getX(), 1.5 + r.getProtectBlock().getY(), 0.5 + r.getProtectBlock().getZ()));
+        if (r instanceof PSGroupRegion) {
+            PSGroupRegion pr = (PSGroupRegion) r;
+            for (PSMergedRegion psmr : pr.getMergedRegions()) {
+                Location purpleLoc = new Location(p.getWorld(), 0.5 + psmr.getProtectBlock().getX(), 1.5 + psmr.getProtectBlock().getY(), 0.5 + psmr.getProtectBlock().getZ());
+                particlePlan.add(new ParticlePlan(purpleLoc, ParticleColor.PURPLE));
                 for (int y = minY; y <= maxY; y += 10) {
-                    handlePurpleParticle(p, new Location(p.getWorld(), 0.5 + r.getProtectBlock().getX(), 0.5 + y, 0.5 + r.getProtectBlock().getZ()));
+                    Location loc = new Location(p.getWorld(), 0.5 + psmr.getProtectBlock().getX(), 0.5 + y, 0.5 + psmr.getProtectBlock().getZ());
+                    particlePlan.add(new ParticlePlan(loc, ParticleColor.PURPLE));
                 }
             }
+        } else {
+            Location purpleLoc = new Location(p.getWorld(), 0.5 + r.getProtectBlock().getX(), 1.5 + r.getProtectBlock().getY(), 0.5 + r.getProtectBlock().getZ());
+            particlePlan.add(new ParticlePlan(purpleLoc, ParticleColor.PURPLE));
+            for (int y = minY; y <= maxY; y += 10) {
+                Location loc = new Location(p.getWorld(), 0.5 + r.getProtectBlock().getX(), 0.5 + y, 0.5 + r.getProtectBlock().getZ());
+                particlePlan.add(new ParticlePlan(loc, ParticleColor.PURPLE));
+            }
+        }
 
-            RegionTraverse.traverseRegionEdge(new HashSet<>(r.getWGRegion().getPoints()), Collections.singletonList(r.getWGRegion()), tr -> {
-                if (tr.isVertex) {
-                    handleBlueParticle(p, new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5+playerY, 0.5+tr.point.getZ()));
-                    for (int y = minY; y <= maxY; y += 5) {
-                        handleBlueParticle(p, new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5+y, 0.5+tr.point.getZ()));
-                    }
-                } else {
-                    if (modU.get() % 2 == 0) {
-                        handlePinkParticle(p, new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5+playerY, 0.5+tr.point.getZ()));
-                        handlePinkParticle(p, new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5+minY, 0.5+tr.point.getZ()));
-                        handlePinkParticle(p, new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5+maxY, 0.5+tr.point.getZ()));
-                    }
-                    modU.set((modU.get() + 1) % 2);
+        AtomicInteger modU = new AtomicInteger(0);
+        RegionTraverse.traverseRegionEdge(new HashSet<>(r.getWGRegion().getPoints()), Collections.singletonList(r.getWGRegion()), tr -> {
+            if (tr.isVertex) {
+                Location blueLoc = new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5, 0.5+tr.point.getZ());
+                particlePlan.add(new ParticlePlan(blueLoc, ParticleColor.BLUE, true));
+                for (int y = minY; y <= maxY; y += 5) {
+                    Location loc = new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5+y, 0.5+tr.point.getZ());
+                    particlePlan.add(new ParticlePlan(loc, ParticleColor.BLUE));
                 }
-            });
+            } else {
+                if (modU.get() % 2 == 0) {
+                    Location pinkLocY = new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5, 0.5+tr.point.getZ());
+                    Location pinkLocMin = new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5+minY, 0.5+tr.point.getZ());
+                    Location pinkLocMax = new Location(p.getWorld(), 0.5+tr.point.getX(), 0.5+maxY, 0.5+tr.point.getZ());
+                    particlePlan.add(new ParticlePlan(pinkLocY, ParticleColor.PINK, true));
+                    particlePlan.add(new ParticlePlan(pinkLocMin, ParticleColor.PINK));
+                    particlePlan.add(new ParticlePlan(pinkLocMax, ParticleColor.PINK));
+                }
+                modU.set((modU.get() + 1) % 2);
+            }
         });
+
+        // send particles on entity thread with live player access
+        FoliaScheduler.runEntity(p, () -> {
+            for (ParticlePlan plan : particlePlan) {
+                switch (plan.color) {
+                    case PINK:
+                        handlePinkParticle(p, plan.location, plan.usePlayerY);
+                        break;
+                    case BLUE:
+                        handleBlueParticle(p, plan.location, plan.usePlayerY);
+                        break;
+                    case PURPLE:
+                        handlePurpleParticle(p, plan.location);
+                        break;
+                }
+            }
+        });
+
         return true;
     }
 
@@ -127,22 +154,49 @@ public class ArgView implements PSCommandArg {
         return null;
     }
 
-    private static int PARTICLE_VIEW_DISTANCE_LIMIT = 150;
+    private enum ParticleColor { PINK, BLUE, PURPLE }
 
-    private static boolean handlePinkParticle(Player p, Location l) {
-        if (p.getLocation().distance(l) > PARTICLE_VIEW_DISTANCE_LIMIT || Math.abs(l.getY()-p.getLocation().getY()) > 30) return false;
+    private static class ParticlePlan {
+        final Location location;
+        final ParticleColor color;
+        final boolean usePlayerY;
+
+        ParticlePlan(Location location, ParticleColor color) {
+            this(location, color, false);
+        }
+
+        ParticlePlan(Location location, ParticleColor color, boolean usePlayerY) {
+            this.location = location;
+            this.color = color;
+            this.usePlayerY = usePlayerY;
+        }
+    }
+
+    private static final int PARTICLE_VIEW_DISTANCE_LIMIT = 150;
+
+    private static boolean handlePinkParticle(Player p, Location l, boolean usePlayerY) {
+        Location playerLoc = p.getLocation();
+        if (usePlayerY) {
+            l = new Location(l.getWorld(), l.getX(), playerLoc.getY(), l.getZ());
+        }
+        if (playerLoc.distance(l) > PARTICLE_VIEW_DISTANCE_LIMIT || Math.abs(l.getY()-playerLoc.getY()) > 30) return false;
         ParticlesUtil.persistRedstoneParticle(p, l, new Particle.DustOptions(Color.fromRGB(233, 30, 99), 2), 30);
         return true;
     }
 
-    private static boolean handleBlueParticle(Player p, Location l) {
-        if (p.getLocation().distance(l) > PARTICLE_VIEW_DISTANCE_LIMIT || Math.abs(l.getY()-p.getLocation().getY()) > 30) return false;
+    private static boolean handleBlueParticle(Player p, Location l, boolean usePlayerY) {
+        Location playerLoc = p.getLocation();
+        if (usePlayerY) {
+            l = new Location(l.getWorld(), l.getX(), playerLoc.getY(), l.getZ());
+        }
+        if (playerLoc.distance(l) > PARTICLE_VIEW_DISTANCE_LIMIT || Math.abs(l.getY()-playerLoc.getY()) > 30) return false;
         ParticlesUtil.persistRedstoneParticle(p, l, new Particle.DustOptions(Color.fromRGB(0, 255, 255), 2), 30);
         return true;
     }
 
     private static boolean handlePurpleParticle(Player p, Location l) {
-        if (p.getLocation().distance(l) > PARTICLE_VIEW_DISTANCE_LIMIT || Math.abs(l.getY()-p.getLocation().getY()) > 30) return false;
+        Location playerLoc = p.getLocation();
+        if (playerLoc.distance(l) > PARTICLE_VIEW_DISTANCE_LIMIT || Math.abs(l.getY()-playerLoc.getY()) > 30) return false;
         ParticlesUtil.persistRedstoneParticle(p, l, new Particle.DustOptions(Color.fromRGB(255, 0, 255), 10), 30);
         return true;
     }

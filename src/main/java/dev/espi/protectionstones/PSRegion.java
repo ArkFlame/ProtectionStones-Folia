@@ -149,14 +149,11 @@ public abstract class PSRegion {
 
         List<PSRegion> l = new ArrayList<>();
 
-        List<String> rIds = ProtectionStones.regionNameToID.get(w.getUID()).get(name);
-        if (rIds == null) return l;
+        List<String> rIds = ProtectionStones.snapshotRegionAliasIds(w, name);
 
-        for (int i = 0; i < rIds.size(); i++) {
-            String id = rIds.get(i);
+        for (String id : rIds) {
             if (rgm.getRegion(id) == null) { // cleanup cache
-                rIds.remove(i);
-                i--;
+                ProtectionStones.removeRegionAlias(w, name, id);
             } else {
                 l.add(fromWGRegion(w, rgm.getRegion(id)));
             }
@@ -173,7 +170,7 @@ public abstract class PSRegion {
 
     public static HashMap<World, List<PSRegion>> fromName(String name) {
         HashMap<World, List<PSRegion>> regions = new HashMap<>();
-        for (UUID worldUid : ProtectionStones.regionNameToID.keySet()) {
+        for (UUID worldUid : ProtectionStones.snapshotRegionAliasCache().keySet()) {
             World w = Bukkit.getWorld(worldUid);
             regions.put(w, fromName(w, name));
         }

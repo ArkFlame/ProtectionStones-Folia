@@ -20,13 +20,37 @@ import com.sk89q.worldguard.protection.regions.ProtectedRegion;
 import dev.espi.protectionstones.PSL;
 import dev.espi.protectionstones.PSRegion;
 import dev.espi.protectionstones.ProtectionStones;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.utils.WGUtils;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
 class ArgAdminHide {
+
+    private static final class HideTarget {
+        private final PSRegion region;
+        private final Location location;
+
+        private HideTarget(PSRegion region) {
+            this.region = region;
+            this.location = region.getProtectBlock().getLocation();
+        }
+    }
+
+    private static final class HideResult {
+        private final String message;
+
+        private HideResult(String message) {
+            this.message = message;
+        }
+    }
 
     // /ps admin hide
     static boolean argumentAdminHide(CommandSender p, String[] args) {
@@ -48,22 +72,58 @@ class ArgAdminHide {
             mgr = WGUtils.getRegionManagerWithWorld(w);
         }
 
-        Bukkit.getScheduler().runTaskAsynchronously(ProtectionStones.getInstance(), () -> {
-            // loop through regions that are protection stones and hide or unhide the block
+        // loop through regions that are protection stones and hide or unhide the block
+        final CommandSender commandSender = p;
+        final String hideAction = args[1];
+        final boolean playerSender = p instanceof Player;
+        FoliaScheduler.callGlobal(() -> {
+            List<HideTarget> targets = new ArrayList<>();
             for (ProtectedRegion r : mgr.getRegions().values()) {
                 if (ProtectionStones.isPSRegion(r)) {
                     PSRegion region = PSRegion.fromWGRegion(w, r);
-                    if (args[1].equalsIgnoreCase("hide")) {
-                        Bukkit.getScheduler().runTask(ProtectionStones.getInstance(), region::hide);
-                    } else if (args[1].equalsIgnoreCase("unhide")){
-                        Bukkit.getScheduler().runTask(ProtectionStones.getInstance(), region::unhide);
+                    if (region != null) {
+                        targets.add(new HideTarget(region));
                     }
                 }
             }
 
-            String hMessage = args[1].equalsIgnoreCase("unhide") ? "unhidden" : "hidden";
-            PSL.msg(p, PSL.ADMIN_HIDE_TOGGLED.msg()
-                    .replace("%message%", hMessage));
+            return new Object[] { hideAction, targets, PSL.ADMIN_HIDE_TOGGLED.msg().replace("%message%", hideAction.equalsIgnoreCase("unhide") ? "unhidden" : "hidden") };
+        }).thenAccept(result -> {
+            Object[] data = (Object[]) result;
+            final String action = (String) data[0];
+            @SuppressWarnings("unchecked")
+            final List<HideTarget> targets = (List<HideTarget>) data[1];
+            final String message = (String) data[2];
+
+            if (targets.isEmpty()) {
+                Runnable completion = () -> PSL.msg(commandSender, message);
+                if (playerSender) {
+                    FoliaScheduler.runEntity((Player) commandSender, completion);
+                } else {
+                    FoliaScheduler.runGlobal(completion);
+                }
+                return;
+            }
+
+            final AtomicInteger remaining = new AtomicInteger(targets.size());
+            for (HideTarget target : targets) {
+                FoliaScheduler.runRegion(target.location, () -> {
+                    if (action.equalsIgnoreCase("hide")) {
+                        target.region.hide();
+                    } else if (action.equalsIgnoreCase("unhide")) {
+                        target.region.unhide();
+                    }
+
+                    if (remaining.decrementAndGet() == 0) {
+                        Runnable completion = () -> PSL.msg(commandSender, message);
+                        if (playerSender) {
+                            FoliaScheduler.runEntity((Player) commandSender, completion);
+                        } else {
+                            FoliaScheduler.runGlobal(completion);
+                        }
+                    }
+                });
+            }
         });
 
         return true;

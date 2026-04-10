@@ -15,6 +15,8 @@
 
 package dev.espi.protectionstones;
 
+import dev.espi.protectionstones.compat.CompatTask;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import com.sk89q.worldguard.protection.managers.RegionManager;
 import com.sk89q.worldguard.protection.managers.storage.StorageException;
 import com.sk89q.worldguard.protection.regions.ProtectedRegion;
@@ -22,7 +24,9 @@ import dev.espi.protectionstones.utils.MiscUtil;
 import dev.espi.protectionstones.utils.WGUtils;
 import net.milkbowl.vault.economy.EconomyResponse;
 import org.bukkit.Bukkit;
+import org.bukkit.Material;
 import org.bukkit.World;
+import org.bukkit.entity.Player;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -38,7 +42,8 @@ import java.util.stream.Collectors;
 
 public class PSEconomy {
     private List<PSRegion> rentedList = new CopyOnWriteArrayList<>();
-    private static int rentRunner = -1, taxRunner = -1;
+    private CompatTask rentRunner = null;
+    private CompatTask taxRunner = null;
 
     public PSEconomy() {
         if (!ProtectionStones.getInstance().isVaultSupportEnabled()) {
@@ -49,11 +54,11 @@ public class PSEconomy {
         loadRentList();
 
         // start rent
-        rentRunner = Bukkit.getScheduler().runTaskTimerAsynchronously(ProtectionStones.getInstance(), this::updateRents, 0, 200).getTaskId();
+        rentRunner = FoliaScheduler.runGlobalTimer(this::updateRents, 0L, 200L);
 
         // start taxes
         if (ProtectionStones.getInstance().getConfigOptions().taxEnabled)
-            taxRunner = Bukkit.getScheduler().runTaskTimerAsynchronously(ProtectionStones.getInstance(), this::updateTaxes, 0, 200).getTaskId();
+            taxRunner = FoliaScheduler.runGlobalTimer(this::updateTaxes, 0L, 200L);
     }
 
     private synchronized void updateRents() {
@@ -89,13 +94,13 @@ public class PSEconomy {
      * Stops the economy cycle. Used for reloads when creating a new PSEconomy.
      */
     public void stop() {
-        if (rentRunner != -1) {
-            Bukkit.getScheduler().cancelTask(rentRunner);
-            rentRunner = -1;
+        if (rentRunner != null) {
+            rentRunner.cancel();
+            rentRunner = null;
         }
-        if (taxRunner != -1) {
-            Bukkit.getScheduler().cancelTask(taxRunner);
-            taxRunner = -1;
+        if (taxRunner != null) {
+            taxRunner.cancel();
+            taxRunner = null;
         }
     }
 
@@ -120,38 +125,48 @@ public class PSEconomy {
 
     /**
      * Process taxes for a region.
+     * Caller must be in the global execution domain.
      *
      * @param r the region to process taxes for
      */
     public static void processTaxes(PSRegion r) {
         // if taxes are enabled for this regions
         if (r.getTypeOptions() != null && r.getTypeOptions().taxPeriod != -1) {
-            Bukkit.getScheduler().runTask(ProtectionStones.getInstance(), () -> {
-                // update tax payments due
-                r.updateTaxPayments();
+            // update tax payments due
+            r.updateTaxPayments();
 
-                // check if a player is set to auto-pay
-                if (!r.getTaxPaymentsDue().isEmpty() && r.getTaxAutopayer() != null) {
-                    PSPlayer psp = PSPlayer.fromUUID(r.getTaxAutopayer());
-                    EconomyResponse res = r.payTax(psp, psp.getBalance());
+            // check if a player is set to auto-pay
+            if (!r.getTaxPaymentsDue().isEmpty() && r.getTaxAutopayer() != null) {
+                PSPlayer psp = PSPlayer.fromUUID(r.getTaxAutopayer());
+                EconomyResponse res = r.payTax(psp, psp.getBalance());
 
-                    if (psp.getPlayer() != null && res.amount != 0) {
-                        PSL.msg(psp.getPlayer(), PSL.TAX_PAID.msg()
-                                .replace("%amount%", String.format("%.2f", res.amount))
-                                .replace("%region%", r.getName() == null ? r.getId() : r.getName() + " (" + r.getId() + ")"));
-                    }
+                Player onlinePlayer = psp.getPlayer();
+                if (onlinePlayer != null && res.amount != 0) {
+                    final double amountPaid = res.amount;
+                    final String regionName = r.getName() == null ? r.getId() : r.getName() + " (" + r.getId() + ")";
+                    FoliaScheduler.runEntity(onlinePlayer, () -> PSL.msg(onlinePlayer, PSL.TAX_PAID.msg()
+                            .replace("%amount%", String.format("%.2f", amountPaid))
+                            .replace("%region%", regionName)));
                 }
+            }
 
-                // late tax payment punishment
-                if (r.isTaxPaymentLate()) {
-                    r.deleteRegion(true); // TODO
+            // late tax payment punishment
+            if (r.isTaxPaymentLate()) {
+                if (r.isHidden()) {
+                    FoliaScheduler.runGlobal(() -> r.deleteRegion(false));
+                } else {
+                    FoliaScheduler.runRegion(r.getProtectBlock().getLocation(), () -> {
+                        r.getProtectBlock().setType(Material.AIR);
+                        FoliaScheduler.runGlobal(() -> r.deleteRegion(false));
+                    });
                 }
-            });
+            }
         }
     }
 
     /**
      * Process a rent payment for a region.
+     * Caller must be in the global execution domain.
      * It does not do any checks, it is expected to check if the rent time has passed before this function is called.
      *
      * @param r the region to perform the rent payment
@@ -162,36 +177,50 @@ public class PSEconomy {
 
         // not enough money for rent
         if (!tenant.hasAmount(r.getPrice())) {
-            if (tenant.getOfflinePlayer().isOnline()) {
-                PSL.msg(Bukkit.getPlayer(r.getTenant()), PSL.RENT_EVICT_NO_MONEY_TENANT.msg()
-                        .replace("%region%", r.getName() != null ? r.getName() : r.getId())
-                        .replace("%price%", String.format("%.2f", r.getPrice())));
+            Player tenantOnline = tenant.getPlayer();
+            if (tenantOnline != null) {
+                final String regionName = r.getName() != null ? r.getName() : r.getId();
+                final String priceStr = String.format("%.2f", r.getPrice());
+                FoliaScheduler.runEntity(tenantOnline, () -> PSL.msg(tenantOnline, PSL.RENT_EVICT_NO_MONEY_TENANT.msg()
+                        .replace("%region%", regionName)
+                        .replace("%price%", priceStr)));
             }
-            if (landlord.getOfflinePlayer().isOnline()) {
-                PSL.msg(Bukkit.getPlayer(r.getLandlord()), PSL.RENT_EVICT_NO_MONEY_LANDLORD.msg()
-                        .replace("%region%", r.getName() != null ? r.getName() : r.getId())
-                        .replace("%tenant%", tenant.getName()));
+            Player landlordOnline = landlord.getPlayer();
+            if (landlordOnline != null) {
+                final String regionName = r.getName() != null ? r.getName() : r.getId();
+                final String tenantName = tenant.getName();
+                FoliaScheduler.runEntity(landlordOnline, () -> PSL.msg(landlordOnline, PSL.RENT_EVICT_NO_MONEY_LANDLORD.msg()
+                        .replace("%region%", regionName)
+                        .replace("%tenant%", tenantName)));
             }
             r.removeRenting();
             return;
         }
 
         // send payment messages
-        if (tenant.getOfflinePlayer().isOnline()) {
-            PSL.msg(Bukkit.getPlayer(r.getTenant()), PSL.RENT_PAID_TENANT.msg()
-                    .replace("%price%", String.format("%.2f", r.getPrice()))
-                    .replace("%landlord%", landlord.getName())
-                    .replace("%region%", r.getName() != null ? r.getName() : r.getId()));
+        Player tenantOnline = tenant.getPlayer();
+        if (tenantOnline != null) {
+            final String priceStr = String.format("%.2f", r.getPrice());
+            final String landlordName = landlord.getName();
+            final String regionName = r.getName() != null ? r.getName() : r.getId();
+            FoliaScheduler.runEntity(tenantOnline, () -> PSL.msg(tenantOnline, PSL.RENT_PAID_TENANT.msg()
+                    .replace("%price%", priceStr)
+                    .replace("%landlord%", landlordName)
+                    .replace("%region%", regionName)));
         }
-        if (landlord.getOfflinePlayer().isOnline()) {
-            PSL.msg(Bukkit.getPlayer(r.getLandlord()), PSL.RENT_PAID_LANDLORD.msg()
-                    .replace("%price%", String.format("%.2f", r.getPrice()))
-                    .replace("%tenant%", tenant.getName())
-                    .replace("%region%", r.getName() != null ? r.getName() : r.getId()));
+        Player landlordOnline = landlord.getPlayer();
+        if (landlordOnline != null) {
+            final String priceStr = String.format("%.2f", r.getPrice());
+            final String tenantName = tenant.getName();
+            final String regionName = r.getName() != null ? r.getName() : r.getId();
+            FoliaScheduler.runEntity(landlordOnline, () -> PSL.msg(landlordOnline, PSL.RENT_PAID_LANDLORD.msg()
+                    .replace("%price%", priceStr)
+                    .replace("%tenant%", tenantName)
+                    .replace("%region%", regionName)));
         }
 
-        // update money must be run in main thread
-        Bukkit.getScheduler().runTask(ProtectionStones.getInstance(), () -> tenant.pay(landlord, r.getPrice()));
+        // run economy transfer in current global phase
+        tenant.pay(landlord, r.getPrice());
         r.setRentLastPaid(Instant.now().getEpochSecond());
         try { // must save region to persist last paid
             r.getWGRegionManager().saveChanges();

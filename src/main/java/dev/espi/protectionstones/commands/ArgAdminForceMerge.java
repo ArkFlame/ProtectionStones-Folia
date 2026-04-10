@@ -23,6 +23,7 @@ import dev.espi.protectionstones.FlagHandler;
 import dev.espi.protectionstones.PSL;
 import dev.espi.protectionstones.PSRegion;
 import dev.espi.protectionstones.ProtectionStones;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.utils.WGMerge;
 import dev.espi.protectionstones.utils.WGUtils;
 import org.bukkit.Bukkit;
@@ -159,24 +160,45 @@ public class ArgAdminForceMerge {
             }
         }
 
-        // actually do region merging
+        // prepare list of merge operations
+        List<MergeOp> mergeOps = new ArrayList<>();
         for (String key : groupToMembers.keySet()) {
             PSRegion root = null;
-            p.sendMessage(ChatColor.GRAY + "Merging these regions into " + key + ":");
             for (PSRegion r : groupToMembers.get(key)) {
                 if (r.getId().equals(key)) root = r;
-                p.sendMessage(ChatColor.GRAY + r.getId());
             }
-            try {
-                WGMerge.mergeRealRegions(w, rm, root, groupToMembers.get(key));
-            } catch (WGMerge.RegionHoleException | WGMerge.RegionCannotMergeWhileRentedException e) {
-                // TODO
+            if (root != null) {
+                mergeOps.add(new MergeOp(key, root, new ArrayList<>(groupToMembers.get(key))));
             }
         }
 
-        p.sendMessage(ChatColor.GRAY + "Done!");
+        final CommandSender commandSender = p;
+        FoliaScheduler.runGlobal(() -> {
+            for (MergeOp op : mergeOps) {
+                FoliaScheduler.runGlobal(() -> {
+                    try {
+                        WGMerge.mergeRealRegions(w, rm, op.root, op.mergeList);
+                        FoliaScheduler.runGlobal(() -> commandSender.sendMessage(ChatColor.GRAY + "Merged group " + op.key));
+                    } catch (WGMerge.RegionHoleException | WGMerge.RegionCannotMergeWhileRentedException e) {
+                        FoliaScheduler.runGlobal(() -> commandSender.sendMessage(ChatColor.RED + "Failed to merge group " + op.key + ": " + e.getClass().getSimpleName()));
+                    }
+                });
+            }
+            FoliaScheduler.runGlobal(() -> commandSender.sendMessage(ChatColor.GRAY + "Done!"));
+        });
 
         return true;
+    }
+
+    private static class MergeOp {
+        String key;
+        PSRegion root;
+        List<PSRegion> mergeList;
+        MergeOp(String key, PSRegion root, List<PSRegion> mergeList) {
+            this.key = key;
+            this.root = root;
+            this.mergeList = mergeList;
+        }
     }
 
     static List<String> tabComplete(CommandSender sender, String alias, String[] args) {

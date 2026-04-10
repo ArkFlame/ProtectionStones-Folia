@@ -20,6 +20,7 @@ import com.sk89q.worldguard.bukkit.WorldGuardPlugin;
 import com.sk89q.worldguard.protection.managers.RegionManager;
 import com.sk89q.worldguard.protection.regions.ProtectedRegion;
 import dev.espi.protectionstones.*;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.utils.WGMerge;
 import dev.espi.protectionstones.utils.WGUtils;
 import net.md_5.bungee.api.chat.ClickEvent;
@@ -30,11 +31,42 @@ import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
+import org.bukkit.World;
 
 import java.util.*;
 import java.util.stream.Collectors;
 
 public class ArgMerge implements PSCommandArg {
+
+    private static final class MergeResult {
+        private enum Type {
+            SUCCESS,
+            HOLE,
+            RENTED_REJECTION
+        }
+
+        private final Type type;
+        private final String message;
+        private final boolean reopenMenu;
+
+        private MergeResult(Type type, String message, boolean reopenMenu) {
+            this.type = type;
+            this.message = message;
+            this.reopenMenu = reopenMenu;
+        }
+
+        private static MergeResult success(boolean reopenMenu) {
+            return new MergeResult(Type.SUCCESS, PSL.MERGE_MERGED.msg(), reopenMenu);
+        }
+
+        private static MergeResult hole() {
+            return new MergeResult(Type.HOLE, PSL.NO_REGION_HOLES.msg(), false);
+        }
+
+        private static MergeResult rentedRejection(String message) {
+            return new MergeResult(Type.RENTED_REJECTION, message, false);
+        }
+    }
     @Override
     public List<String> getNames() {
         return Arrays.asList("merge");
@@ -129,24 +161,29 @@ public class ArgMerge implements PSCommandArg {
             if (!WGUtils.canMergeRegionTypes(aRegion.getTypeOptions(), aRoot))
                 return PSL.msg(p, PSL.MERGE_NOT_ALLOWED.msg());
 
-            Bukkit.getScheduler().runTaskAsynchronously(ProtectionStones.getInstance(), () -> {
+            Player commandPlayer = p;
+            RegionManager commandRm = rm;
+            World commandWorld = p.getWorld();
+            FoliaScheduler.callGlobal(() -> {
                 try {
-                    WGMerge.mergeRealRegions(p.getWorld(), rm, aRoot, Arrays.asList(aRegion, aRoot));
+                    WGMerge.mergeRealRegions(commandWorld, commandRm, aRoot, Arrays.asList(aRegion, aRoot));
+                    PSRegion mergedRoot = PSRegion.fromWGRegion(commandWorld, commandRm.getRegion(aRoot.getId()));
+                    boolean reopenMenu = mergedRoot != null && !getGUI(commandPlayer, mergedRoot).isEmpty();
+                    return MergeResult.success(reopenMenu);
                 } catch (WGMerge.RegionHoleException e) {
-                    PSL.msg(p, PSL.NO_REGION_HOLES.msg());
-                    return;
+                    return MergeResult.hole();
                 } catch (WGMerge.RegionCannotMergeWhileRentedException e) {
-                    PSL.msg(p, PSL.CANNOT_MERGE_RENTED_REGION.msg().replace("%region%", e.getRentedRegion().getName() == null ? e.getRentedRegion().getId() : e.getRentedRegion().getName()));
-                    return;
+                    return MergeResult.rentedRejection(PSL.CANNOT_MERGE_RENTED_REGION.msg().replace("%region%", e.getRentedRegion().getName() == null ? e.getRentedRegion().getId() : e.getRentedRegion().getName()));
                 }
-                PSL.msg(p, PSL.MERGE_MERGED.msg());
-
-                // show menu again if the new region still has overlapping regions
-                Bukkit.getScheduler().runTask(ProtectionStones.getInstance(), () -> {
-                    if (!getGUI(p, PSRegion.fromWGRegion(p.getWorld(), rm.getRegion(aRoot.getId()))).isEmpty()) {
-                        Bukkit.dispatchCommand(p, ProtectionStones.getInstance().getConfigOptions().base_command + " merge");
+            }).thenAccept(result -> {
+                Runnable completion = () -> {
+                    MergeResult mergeResult = (MergeResult) result;
+                    PSL.msg(commandPlayer, mergeResult.message);
+                    if (mergeResult.type == MergeResult.Type.SUCCESS && mergeResult.reopenMenu) {
+                        FoliaScheduler.runGlobal(() -> Bukkit.dispatchCommand(commandPlayer, ProtectionStones.getInstance().getConfigOptions().base_command + " merge"));
                     }
-                });
+                };
+                FoliaScheduler.runEntity(commandPlayer, completion);
             });
 
         } else {

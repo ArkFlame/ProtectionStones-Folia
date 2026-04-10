@@ -16,6 +16,7 @@
 package dev.espi.protectionstones.commands;
 
 import dev.espi.protectionstones.*;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.utils.ChatUtil;
 import dev.espi.protectionstones.utils.MiscUtil;
 import dev.espi.protectionstones.utils.TextGUI;
@@ -23,18 +24,18 @@ import net.md_5.bungee.api.chat.ClickEvent;
 import net.md_5.bungee.api.chat.ComponentBuilder;
 import net.md_5.bungee.api.chat.HoverEvent;
 import net.md_5.bungee.api.chat.TextComponent;
-import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.util.StringUtil;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 public class ArgHome implements PSCommandArg {
 
-    private static HashMap<UUID, List<String>> tabCache = new HashMap<>();
+    private static ConcurrentHashMap<UUID, List<String>> tabCache = new ConcurrentHashMap<>();
 
     @Override
     public List<String> getNames() {
@@ -62,30 +63,38 @@ public class ArgHome implements PSCommandArg {
     @Override
     public List<String> tabComplete(CommandSender sender, String alias, String[] args) {
         if (!(sender instanceof Player p)) return null;
-        PSPlayer psp = PSPlayer.fromPlayer(p);
 
         if (args.length == 2) {
+            UUID snapshotUuid = p.getUniqueId();
+            org.bukkit.World snapshotWorld = p.getWorld();
 
-            // add to cache if not already
-            if (tabCache.get(p.getUniqueId()) == null) {
-                List<PSRegion> regions = psp.getHomes(p.getWorld());
-                List<String> regionNames = new ArrayList<>();
-                for (PSRegion r : regions) {
-                    if (r.getName() != null) {
-                        regionNames.add(r.getName());
-                    } else {
-                        regionNames.add(r.getId());
+            if (tabCache.get(snapshotUuid) == null) {
+                FoliaScheduler.callGlobal(() -> {
+                    PSPlayer psp = PSPlayer.fromUUID(snapshotUuid);
+                    List<PSRegion> regions = psp.getHomes(snapshotWorld);
+                    List<String> regionNames = new ArrayList<>();
+                    for (PSRegion r : regions) {
+                        if (r.getName() != null) {
+                            regionNames.add(r.getName());
+                        } else {
+                            regionNames.add(r.getId());
+                        }
                     }
-                }
-                // cache home regions
-                tabCache.put(p.getUniqueId(), regionNames);
-
-                Bukkit.getScheduler().runTaskLater(ProtectionStones.getInstance(), () -> {
-                    tabCache.remove(p.getUniqueId());
-                }, 200); // remove cache after 10 seconds
+                    return Collections.unmodifiableList(regionNames);
+                }).thenAccept(result -> {
+                    @SuppressWarnings("unchecked")
+                    List<String> immutableNames = (List<String>) result;
+                    tabCache.put(snapshotUuid, immutableNames);
+                    FoliaScheduler.runAsyncLater(() -> tabCache.remove(snapshotUuid), 200L);
+                });
+                return new ArrayList<>();
             }
 
-            return StringUtil.copyPartialMatches(args[1], tabCache.get(p.getUniqueId()), new ArrayList<>());
+            List<String> cached = tabCache.get(snapshotUuid);
+            if (cached != null) {
+                return StringUtil.copyPartialMatches(args[1], cached, new ArrayList<>());
+            }
+            return new ArrayList<>();
         }
         return null;
     }
@@ -128,38 +137,59 @@ public class ArgHome implements PSCommandArg {
         if (args.length != 2 && args.length != 1)
             return PSL.msg(p, PSL.HOME_HELP.msg());
 
-        Bukkit.getScheduler().runTaskAsynchronously(ProtectionStones.getInstance(), () -> {
-            PSPlayer psp = PSPlayer.fromPlayer(p);
-            if (args.length == 1) {
-                // just "/ps home"
-                List<PSRegion> regions = psp.getHomes(p.getWorld());
-                if (regions.size() == 1) { // teleport to home if there is only one home
-                    ArgTp.teleportPlayer(p, regions.get(0));
-                } else { // otherwise, open the GUI
-                    openHomeGUI(psp, regions, (flags.get("-p") == null || !MiscUtil.isValidInteger(flags.get("-p")) ? 0 : Integer.parseInt(flags.get("-p")) - 1));
+        UUID snapshotUuid = p.getUniqueId();
+        org.bukkit.World snapshotWorld = p.getWorld();
+        String snapshotQuery = args.length == 2 ? args[1] : null;
+        int snapshotPage = flags.get("-p") == null || !MiscUtil.isValidInteger(flags.get("-p")) ? 0 : Integer.parseInt(flags.get("-p")) - 1;
+
+        FoliaScheduler.callGlobal(() -> {
+            PSPlayer psp = PSPlayer.fromUUID(snapshotUuid);
+            if (snapshotQuery == null) {
+                List<PSRegion> regions = psp.getHomes(snapshotWorld);
+                if (regions.size() == 1) {
+                    return new Object[] { "SINGLE_HOME", regions.get(0) };
+                } else if (regions.isEmpty()) {
+                    return new Object[] { "NO_REGIONS" };
+                } else {
+                    return new Object[] { "MULTI_HOME", psp, regions, snapshotPage };
                 }
-            } else {// /ps home [id]
-                // get regions from the query
-                String query = args[1];
-                List<PSRegion> regions = psp.getHomes(p.getWorld())
+            } else {
+                List<PSRegion> regions = psp.getHomes(snapshotWorld)
                         .stream()
-                        .filter(region -> region.getId().equals(query)
-                                || (region.getName() != null && region.getName().equals(query)))
+                        .filter(region -> region.getId().equals(snapshotQuery)
+                                || (region.getName() != null && region.getName().equals(snapshotQuery)))
                         .collect(Collectors.toList());
 
                 if (regions.isEmpty()) {
-                    PSL.msg(s, PSL.REGION_DOES_NOT_EXIST.msg());
-                    return;
+                    return new Object[] { "NOT_FOUND" };
+                } else if (regions.size() > 1) {
+                    return new Object[] { "DUPLICATE_ALIAS", regions };
+                } else {
+                    return new Object[] { "SINGLE_HOME", regions.get(0) };
                 }
-
-                // if there is more than one name in the query
-                if (regions.size() > 1) {
-                    ChatUtil.displayDuplicateRegionAliases(p, regions);
-                    return;
-                }
-
-                ArgTp.teleportPlayer(p, regions.get(0));
             }
+        }).thenAccept(result -> {
+            FoliaScheduler.runEntity(p, () -> {
+                Object[] data = (Object[]) result;
+                String type = (String) data[0];
+                if ("SINGLE_HOME".equals(type)) {
+                    PSRegion r = (PSRegion) data[1];
+                    ArgTp.teleportPlayer(p, r);
+                } else if ("MULTI_HOME".equals(type)) {
+                    @SuppressWarnings("unchecked")
+                    List<PSRegion> regions = (List<PSRegion>) data[2];
+                    int page = (int) data[3];
+                    openHomeGUI((PSPlayer) data[1], regions, page);
+                } else if ("NOT_FOUND".equals(type)) {
+                    PSL.msg(p, PSL.REGION_DOES_NOT_EXIST.msg());
+                } else if ("DUPLICATE_ALIAS".equals(type)) {
+                    @SuppressWarnings("unchecked")
+                    List<PSRegion> regions = (List<PSRegion>) data[1];
+                    ChatUtil.displayDuplicateRegionAliases(p, regions);
+                } else if ("NO_REGIONS".equals(type)) {
+                    PSL.msg(p, PSL.REGION_DOES_NOT_EXIST.msg());
+                }
+            });
         });
 
         return true;

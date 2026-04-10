@@ -16,6 +16,7 @@
 package dev.espi.protectionstones.utils;
 
 import dev.espi.protectionstones.ProtectionStones;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Particle;
@@ -24,7 +25,7 @@ import org.bukkit.entity.Player;
 public class ParticlesUtil {
     public static void persistRedstoneParticle(Player p, Location l, Particle.DustOptions d, int occ) {
         for (int i = 0; i < occ; i++) {
-            Bukkit.getScheduler().runTaskLater(ProtectionStones.getInstance(), () -> {
+            FoliaScheduler.runEntityLater(p, () -> {
                 if (!p.isOnline()) return;
 
                 // Stronger "glow marker" burst
@@ -41,7 +42,7 @@ public class ParticlesUtil {
                         0.0
                 );
 
-            }, i * 20L);
+            }, null, i * 20L);
         }
     }
 }

@@ -28,6 +28,7 @@ import dev.espi.protectionstones.event.PSCreateEvent;
 import dev.espi.protectionstones.event.PSRemoveEvent;
 import dev.espi.protectionstones.utils.RecipeUtil;
 import dev.espi.protectionstones.utils.UUIDCache;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.utils.WGUtils;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
@@ -54,6 +55,7 @@ import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 
 import java.util.List;
+import java.util.UUID;
 
 public class ListenerClass implements Listener {
 
@@ -67,7 +69,7 @@ public class ListenerClass implements Listener {
         UUIDCache.storeUUIDNamePair(p.getUniqueId(), p.getName());
 
         // allow worldguard to resolve all UUIDs to names
-        Bukkit.getScheduler().runTaskAsynchronously(ProtectionStones.getInstance(), () -> UUIDCache.storeWGProfile(p.getUniqueId(), p.getName()));
+        FoliaScheduler.runAsync(() -> UUIDCache.storeWGProfile(p.getUniqueId(), p.getName()));
 
         // add recipes to player's recipe book
         p.discoverRecipes(RecipeUtil.getRecipeKeys());
@@ -81,16 +83,19 @@ public class ListenerClass implements Listener {
 
         // tax join message
         if (ProtectionStones.getInstance().getConfigOptions().taxEnabled && ProtectionStones.getInstance().getConfigOptions().taxMessageOnJoin) {
-            Bukkit.getScheduler().runTaskAsynchronously(ProtectionStones.getInstance(), () -> {
+            UUID playerUuid = p.getUniqueId();
+            FoliaScheduler.callGlobal(() -> {
+                PSPlayer taxPsp = PSPlayer.fromUUID(playerUuid);
                 int amount = 0;
-                for (PSRegion psr : psp.getTaxEligibleRegions()) {
+                for (PSRegion psr : taxPsp.getTaxEligibleRegions()) {
                     for (PSRegion.TaxPayment tp : psr.getTaxPaymentsDue()) {
                         amount += tp.getAmount();
                     }
                 }
-
+                return amount;
+            }).thenAccept(amount -> {
                 if (amount != 0) {
-                    PSL.msg(psp, PSL.TAX_JOIN_MSG_PENDING_PAYMENTS.msg().replace("%money%", "" + amount));
+                    FoliaScheduler.runEntity(p, () -> PSL.msg(p, PSL.TAX_JOIN_MSG_PENDING_PAYMENTS.msg().replace("%money%", "" + amount)));
                 }
             });
         }
@@ -576,12 +581,12 @@ public class ListenerClass implements Listener {
         if (!event.getRegion().getTypeOptions().eventsEnabled) return;
 
         // run on next tick (after the region is created to allow for edits to the region)
-        Bukkit.getServer().getScheduler().runTask(ProtectionStones.getInstance(), () -> {
+        FoliaScheduler.runGlobalLater(() -> {
             // run custom commands (in config)
             for (String action : event.getRegion().getTypeOptions().regionCreateCommands) {
                 execEvent(action, event.getPlayer(), event.getPlayer().getName(), event.getRegion());
             }
-        });
+        }, 1L);
     }
 
     @EventHandler

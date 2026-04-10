@@ -22,6 +22,7 @@ import com.sk89q.worldguard.protection.managers.RegionManager;
 import com.sk89q.worldguard.protection.regions.ProtectedRegion;
 import dev.espi.protectionstones.commands.ArgHelp;
 import dev.espi.protectionstones.commands.PSCommandArg;
+import dev.espi.protectionstones.compat.FoliaScheduler;
 import dev.espi.protectionstones.placeholders.PSPlaceholderExpansion;
 import dev.espi.protectionstones.utils.BlockUtil;
 import dev.espi.protectionstones.utils.RecipeUtil;
@@ -48,6 +49,8 @@ import net.luckperms.api.LuckPerms;
 import java.io.File;
 import java.lang.reflect.Field;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.logging.Logger;
 
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -74,12 +77,12 @@ public class ProtectionStones extends JavaPlugin {
 
     // all configuration file options are stored in here
     private PSConfig configOptions;
-    static HashMap<String, PSProtectBlock> protectionStonesOptions = new HashMap<>();
+    static ConcurrentHashMap<String, PSProtectBlock> protectionStonesOptions = new ConcurrentHashMap<>();
 
 
     // ps alias to id cache
     // <world-name, <alias, [ids]>>
-    static HashMap<UUID, HashMap<String, ArrayList<String>>> regionNameToID = new HashMap<>();
+    static ConcurrentHashMap<UUID, ConcurrentHashMap<String, CopyOnWriteArrayList<String>>> regionNameToID = new ConcurrentHashMap<>();
 
     // vault economy integration
     private boolean vaultSupportEnabled = false;
@@ -92,7 +95,44 @@ public class ProtectionStones extends JavaPlugin {
     private boolean placeholderAPISupportEnabled = false;
 
     // ps toggle/on/off list
-    public static Set<UUID> toggleList = new HashSet<>();
+    public static Set<UUID> toggleList = ConcurrentHashMap.newKeySet();
+
+    public static void addRegionAlias(World world, String alias, String regionId) {
+        if (world == null || alias == null || regionId == null) return;
+        regionNameToID.computeIfAbsent(world.getUID(), k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(alias, k -> new CopyOnWriteArrayList<>())
+                .addIfAbsent(regionId);
+    }
+
+    public static void removeRegionAlias(World world, String alias, String regionId) {
+        if (world == null || alias == null || regionId == null) return;
+        ConcurrentHashMap<String, CopyOnWriteArrayList<String>> aliases = regionNameToID.get(world.getUID());
+        if (aliases == null) return;
+        CopyOnWriteArrayList<String> ids = aliases.get(alias);
+        if (ids == null) return;
+        ids.remove(regionId);
+        if (ids.isEmpty()) aliases.remove(alias, ids);
+    }
+
+    public static List<String> snapshotRegionAliasIds(World world, String alias) {
+        if (world == null || alias == null) return new ArrayList<>();
+        ConcurrentHashMap<String, CopyOnWriteArrayList<String>> aliases = regionNameToID.get(world.getUID());
+        if (aliases == null) return new ArrayList<>();
+        CopyOnWriteArrayList<String> ids = aliases.get(alias);
+        return ids == null ? new ArrayList<>() : new ArrayList<>(ids);
+    }
+
+    public static Map<UUID, Map<String, List<String>>> snapshotRegionAliasCache() {
+        Map<UUID, Map<String, List<String>>> snapshot = new HashMap<>();
+        for (Map.Entry<UUID, ConcurrentHashMap<String, CopyOnWriteArrayList<String>>> entry : regionNameToID.entrySet()) {
+            Map<String, List<String>> aliases = new HashMap<>();
+            for (Map.Entry<String, CopyOnWriteArrayList<String>> aliasEntry : entry.getValue().entrySet()) {
+                aliases.put(aliasEntry.getKey(), new ArrayList<>(aliasEntry.getValue()));
+            }
+            snapshot.put(entry.getKey(), aliases);
+        }
+        return snapshot;
+    }
 
     /* ~~~~~~~~~~ Instance methods ~~~~~~~~~~~~ */
 
@@ -555,6 +595,7 @@ public class ProtectionStones extends JavaPlugin {
         Config.setInsertionOrderPreserved(true); // make sure that config upgrades aren't a complete mess
 
         plugin = this;
+        FoliaScheduler.init(this);
         configLocation = new File(this.getDataFolder() + "/config.toml");
         blockDataFolder = new File(this.getDataFolder() + "/blocks");
 
@@ -620,24 +661,18 @@ public class ProtectionStones extends JavaPlugin {
         HashMap<World, RegionManager> regionManagers = WGUtils.getAllRegionManagers();
         for (World w : regionManagers.keySet()) {
             RegionManager rgm = regionManagers.get(w);
-            HashMap<String, ArrayList<String>> m = new HashMap<>();
             for (ProtectedRegion r : rgm.getRegions().values()) {
                 String name = r.getFlag(FlagHandler.PS_NAME);
                 if (isPSRegion(r) && name != null) {
-                    if (m.containsKey(name)) {
-                        m.get(name).add(r.getId());
-                    } else {
-                        m.put(name, new ArrayList<>(Collections.singletonList(r.getId())));
-                    }
+                    addRegionAlias(w, name, r.getId());
                 }
             }
-            regionNameToID.put(w.getUID(), m);
         }
 
         // uuid cache
         getLogger().info("Building UUID cache... (if slow change async-load-uuid-cache in the config to true)");
         if (configOptions.asyncLoadUUIDCache) { // async load
-            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            FoliaScheduler.runAsync(() -> {
                 for (OfflinePlayer op : Bukkit.getOfflinePlayers()) {
                     UUIDCache.storeUUIDNamePair(op.getUniqueId(), op.getName());
                 }
@@ -659,6 +694,15 @@ public class ProtectionStones extends JavaPlugin {
             LegacyUpgrade.upgradeRegionsWithNegativeYValues();
 
         getLogger().info(ChatColor.WHITE + "ProtectionStones has successfully started!");
+    }
+
+    @Override
+    public void onDisable() {
+        if (economy != null) {
+            economy.stop();
+        }
+        FoliaScheduler.cancelPluginTasks();
+        FoliaScheduler.shutdown();
     }
 
 }
